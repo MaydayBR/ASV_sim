@@ -3,6 +3,8 @@ import time
 import matplotlib.pyplot as plt
 import csv
 import random
+import socket
+import json
 
 # Waypoints (targets)
 waypoints = [(10, 0), (10, 12), (1,4), (0, 0)]
@@ -348,6 +350,17 @@ def compute_avoid_vector(x, y, obstacles, safety_margin):
     return ax_avoid, ay_avoid
 
 
+TELEM_IP = "127.0.0.1"   # localhost (your machine)
+TELEM_PORT = 5005
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+def send_telemetry(sock, ip, port, data):
+    """
+    Sends one telemetry packet via UDP as JSON.
+    """
+    msg = json.dumps(data).encode("utf-8")
+    sock.sendto(msg, (ip, port))
 
 
 start_time = time.time()
@@ -430,6 +443,31 @@ with open("run_log.csv", "w", newline="") as f:
 
         # Update plot
         update_plot(x, y, gps_x, gps_y, heading, path_x, path_y, lidar_angles, lidar_ranges)
+
+        #Telemetry
+        obs_dist = nearest_obstacle_surface_dist(gps_x, gps_y, obstacles)
+        avoid_mag = math.hypot(avoid_x, avoid_y)
+        telemetry = {
+            "t_s": round(t_s, 3),
+            "x": round(x, 3),
+            "y": round(y, 3),
+            "gps_x": round(gps_x, 3),
+            "gps_y": round(gps_y, 3),
+            "gps_drop": bool(gps_drop),
+
+            "heading_deg": round(math.degrees(heading), 2),
+
+            "wp_index": int(i),
+            "wp_reached": int(wp_reached),
+            "tx": round(tx, 3),
+            "ty": round(ty, 3),
+            "dist_to_wp": round(dist, 3),
+
+            "nearest_obs_surface_dist": round(obs_dist, 3),
+            "avoid_mag": round(avoid_mag, 3),
+        }
+        send_telemetry(sock, TELEM_IP, TELEM_PORT, telemetry)
+
         time.sleep(dt)
 
     #update hud 1 last time to show 4/4

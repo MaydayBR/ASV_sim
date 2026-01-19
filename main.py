@@ -5,12 +5,12 @@ import csv
 import random
 
 # Waypoints (targets)
-waypoints = [(10, 0), (10, 10), (1,4), (0, 0)]
+waypoints = [(10, 0), (10, 12), (1,4), (0, 0)]
 
 #obstacles (x,y,radius)
 obstacles = [(6.0, 0.0, 1.0), (10.0, 8.0, 1.0), (4.0, 7.0, 1.0)]
 
-safety_margin = 0.6  # extra buffer around obstacle (avoid earlier)
+safety_margin = 0.3  # extra buffer around obstacle (avoid earlier)
 
 # Boat starting position
 x, y = 0.0, 0.0
@@ -26,6 +26,9 @@ heading = 0.0                                       #where the boat currently fa
 max_turn_rate_deg = 160.0                            # degrees per second (tune: 30..120)
 max_turn_rate = math.radians(max_turn_rate_deg)     # convert to rad/s
 
+# -----------------------
+# GPS settings
+# -----------------------
 gps_sigma = 0.15          # noise std-dev in "world units" (tune: 0.05..0.30)
 gps_dropout_prob = 0.02   # 2% chance gps fails each tick (tune: 0.0..0.10)
 gps_x, gps_y = x, y       # last known GPS measurement
@@ -43,6 +46,15 @@ def read_gps(true_x, true_y, last_gps_x, last_gps_y, sigma, dropout_prob):
     meas_y = true_y + random.gauss(0.0, sigma)
     return meas_x, meas_y, False
 
+# -----------------------
+# LIDAR-lite settings
+# -----------------------
+lidar_num_rays = 21
+lidar_fov_deg = 120.0                 # forward field-of-view
+lidar_max_range = 4.0                 # how far the sensor can see
+lidar_sigma = 0.03                    # range noise (small)
+lidar_dropout_prob = 0.01             # per-ray dropout chance
+
 
 # Store path for drawing
 path_x = [x]
@@ -52,7 +64,7 @@ path_y = [y]
 plt.ion()  # interactive mode ON
 fig, ax = plt.subplots()
 ax.set_aspect("equal", adjustable="box")
-ax.set_title("Waypoint Autopilot (simple)")
+ax.set_title("Waypoint Autopilot GPS + LIDAR (simple)")
 ax.set_xlabel("X")
 ax.set_ylabel("Y")
 
@@ -85,6 +97,12 @@ heading_arrow = ax.quiver(
     angles="xy", scale_units="xy", scale=1,
     width=0.008, zorder=6
 )
+
+# LIDAR ray artists (lines)
+ray_lines = []
+for _ in range(lidar_num_rays):
+    line, = ax.plot([], [], linewidth=1, alpha=0.5)
+    ray_lines.append(line)
 
 # Make the view a bit larger than waypoints
 margin = 2
@@ -132,46 +150,51 @@ def nearest_obstacle_surface_dist(x, y, obstacles):
     return best
 
 
-def determine_speed(dist_to_wp, x, y, obstacles):
-    # --- Waypoint slowdown (your current logic) ---
+
+def determine_speed(dist_to_wp, lidar_min_range):
+    """
+    Speed slowed by:
+      - distance to waypoint
+      - nearest lidar obstacle range (sensor-based)
+    """
+    # Waypoint slowdown
     wp_factor = min(1.0, dist_to_wp / slow_thresh)
-    wp_factor = max(0.15, wp_factor)   # min 15% speed
+    wp_factor = max(0.15, wp_factor)
 
-    # --- Obstacle slowdown (NEW) ---
-    obs_surface_dist = nearest_obstacle_surface_dist(x, y, obstacles)
+    # Obstacle slowdown based on lidar
+    obs_slow_thresh = 2.0     # start slowing if obstacle is within 2 units
+    obs_min_factor = 0.05
 
-    obs_slow_thresh = 2.0      # start slowing when within 2 units of obstacle surface
-    obs_min_factor = 0.05      # can go slower near obstacles than near waypoints
-
-    # If far from obstacles, factor = 1.0. If near, ramps down toward obs_min_factor.
-    if obs_surface_dist >= obs_slow_thresh:
+    if lidar_min_range >= obs_slow_thresh:
         obs_factor = 1.0
     else:
-        # map surface_dist from [0..obs_slow_thresh] to [0..1]
-        t = max(0.0, obs_surface_dist) / obs_slow_thresh  # clamp negative to 0
-        # t=1 -> far (factor 1), t=0 -> at surface (min)
+        t = max(0.0, lidar_min_range) / obs_slow_thresh  # 0..1
         obs_factor = obs_min_factor + (1.0 - obs_min_factor) * t
 
-    # --- Combine: take the smaller (more cautious) factor ---
     speed_factor = min(wp_factor, obs_factor)
-
     step_used = fast_step * speed_factor
 
-    # overshoot clamp relative to waypoint
-    return min(step_used, dist_to_wp)
+    return min(step_used, dist_to_wp)  # clamp overshoot to target
 
 
 
-def update_plot(true_x, true_y, gps_x, gps_y, heading, path_x, path_y):
+def update_plot(true_x, true_y, gps_x, gps_y, heading, path_x, path_y,
+                lidar_angles, lidar_ranges):
     boat_dot.set_data([true_x], [true_y])
     path_line.set_data(path_x, path_y)
-
     gps_dot.set_data([gps_x], [gps_y])
 
+    # Heading arrow
     u = heading_len * math.cos(heading)
     v = heading_len * math.sin(heading)
     heading_arrow.set_offsets([true_x, true_y])
     heading_arrow.set_UVC(u, v)
+
+    # LIDAR rays (draw from boat out to measured range)
+    for line, ang, r in zip(ray_lines, lidar_angles, lidar_ranges):
+        x2 = true_x + math.cos(ang) * r
+        y2 = true_y + math.sin(ang) * r
+        line.set_data([true_x, x2], [true_y, y2])
 
     fig.canvas.draw()
     fig.canvas.flush_events()
@@ -193,6 +216,107 @@ def update_heading(current_heading, desired_heading, max_turn_rate_rad_s, dt_s):
     elif error < -max_delta:
         error = -max_delta
     return wrap_to_pi(current_heading + error)
+
+
+# -----------------------
+# Ray / circle intersection
+# -----------------------
+def ray_circle_hit_distance(px, py, dx, dy, cx, cy, radius):
+    """
+    Ray: P + t*D (t >= 0), D must be unit vector.
+    Returns smallest t that hits circle, or None if no hit.
+    """
+    fx = px - cx
+    fy = py - cy
+
+    b = 2.0 * (fx * dx + fy * dy)
+    c = (fx * fx + fy * fy) - radius * radius
+
+    disc = b * b - 4.0 * c  # a = 1 since D is unit length
+    if disc < 0.0:
+        return None
+
+    sqrt_disc = math.sqrt(disc)
+    t1 = (-b - sqrt_disc) / 2.0
+    t2 = (-b + sqrt_disc) / 2.0
+
+    # We want the nearest non-negative hit
+    if t1 >= 0.0:
+        return t1
+    if t2 >= 0.0:
+        return t2
+    return None
+
+def lidar_scan(px, py, heading, obstacles, safety_margin,
+              num_rays, fov_deg, max_range, sigma, dropout_prob):
+    """
+    Returns:
+      angles: list of ray world angles
+      ranges: list of measured distances (0..max_range)
+    Rays are centered on heading across +/- fov/2.
+    """
+    angles = []
+    ranges = []
+
+    if num_rays == 1:
+        rel_angles = [0.0]
+    else:
+        fov_rad = math.radians(fov_deg)
+        start = -0.5 * fov_rad
+        step = fov_rad / (num_rays - 1)
+        rel_angles = [start + k * step for k in range(num_rays)]
+
+    for rel in rel_angles:
+        ang = heading + rel
+        dx = math.cos(ang)
+        dy = math.sin(ang)
+
+        best = None
+        for (ox, oy, r) in obstacles:
+            inflated_r = r + safety_margin
+            t_hit = ray_circle_hit_distance(px, py, dx, dy, ox, oy, inflated_r)
+            if t_hit is not None and t_hit <= max_range:
+                if best is None or t_hit < best:
+                    best = t_hit
+
+        # If no hit, return max_range
+        true_range = max_range if best is None else best
+
+        # Dropout -> pretend no hit
+        if random.random() < dropout_prob:
+            meas = max_range
+        else:
+            meas = true_range + random.gauss(0.0, sigma)
+            meas = max(0.0, min(max_range, meas))
+
+        angles.append(ang)
+        ranges.append(meas)
+
+    return angles, ranges
+
+def avoid_vector_from_lidar(angles, ranges, max_range):
+    """
+    Convert ranges into an avoidance vector.
+    - Close hits contribute strong push away.
+    - Far/no hits contribute almost nothing.
+    """
+    ax_avoid = 0.0
+    ay_avoid = 0.0
+
+    for ang, r in zip(angles, ranges):
+        # Normalize "closeness": 0 far, 1 very close
+        closeness = (max_range - r) / max_range
+        if closeness <= 0.0:
+            continue
+
+        # Stronger as you get closer (square it)
+        strength = closeness * closeness
+
+        # Ray points in direction ang, so "away" is opposite
+        ax_avoid += -math.cos(ang) * strength
+        ay_avoid += -math.sin(ang) * strength
+
+    return ax_avoid, ay_avoid
 
 def compute_avoid_vector(x, y, obstacles, safety_margin):
     ax_avoid = 0.0
@@ -271,12 +395,23 @@ with open("run_log.csv", "w", newline="") as f:
             goal_dy = dy / dist
         else:
             goal_dx, goal_dy = 0.0, 0.0
-        # avoid direction (away from obstacles)
-        avoid_x, avoid_y = compute_avoid_vector(gps_x, gps_y, obstacles, safety_margin)
-        # Blend them:
-        avoid_weight = 9.0   # tune: bigger = stronger avoidance
-        blend_dx = goal_dx + (avoid_weight * avoid_x)
-        blend_dy = goal_dy + (avoid_weight * avoid_y)
+
+        # LIDAR scan (sensor)
+        lidar_angles, lidar_ranges = lidar_scan(
+            x, y, heading,
+            obstacles, safety_margin,
+            lidar_num_rays, lidar_fov_deg, lidar_max_range,
+            lidar_sigma, lidar_dropout_prob
+        )
+        lidar_min = min(lidar_ranges) if lidar_ranges else lidar_max_range
+
+         # Turn sensor ranges into avoidance vector
+        avoid_x, avoid_y = avoid_vector_from_lidar(lidar_angles, lidar_ranges, lidar_max_range)
+
+        # Blend goal + avoid
+        avoid_weight = 6.0   # tune this
+        blend_dx = goal_dx + avoid_weight * avoid_x
+        blend_dy = goal_dy + avoid_weight * avoid_y
 
         desired_heading = math.atan2(blend_dy, blend_dx)
 
@@ -286,7 +421,7 @@ with open("run_log.csv", "w", newline="") as f:
 
 
         #determine speed of boat 
-        step_used = determine_speed(dist, gps_x, gps_y, obstacles)
+        step_used = determine_speed(dist, lidar_min)
         # Move boat towards target
         x += math.cos(heading) * step_used
         y += math.sin(heading) * step_used
@@ -294,7 +429,7 @@ with open("run_log.csv", "w", newline="") as f:
         path_y.append(y)
 
         # Update plot
-        update_plot(x, y, gps_x, gps_y, heading, path_x, path_y)
+        update_plot(x, y, gps_x, gps_y, heading, path_x, path_y, lidar_angles, lidar_ranges)
         time.sleep(dt)
 
     #update hud 1 last time to show 4/4

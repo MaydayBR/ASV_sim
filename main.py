@@ -2,6 +2,7 @@ import math
 import time
 import matplotlib.pyplot as plt
 import csv
+import random
 
 # Waypoints (targets)
 waypoints = [(10, 0), (10, 10), (1,4), (0, 0)]
@@ -24,6 +25,24 @@ slow_thresh = 2.0           #radius where we need to slow down
 heading = 0.0                                       #where the boat currently faces 
 max_turn_rate_deg = 160.0                            # degrees per second (tune: 30..120)
 max_turn_rate = math.radians(max_turn_rate_deg)     # convert to rad/s
+
+gps_sigma = 0.15          # noise std-dev in "world units" (tune: 0.05..0.30)
+gps_dropout_prob = 0.02   # 2% chance gps fails each tick (tune: 0.0..0.10)
+gps_x, gps_y = x, y       # last known GPS measurement
+
+def read_gps(true_x, true_y, last_gps_x, last_gps_y, sigma, dropout_prob):
+    """
+    Simulates a GPS sensor.
+    - Usually returns true position + noise.
+    - Sometimes "drops out" and returns the last measurement (hold-last-value behavior).
+    """
+    if random.random() < dropout_prob:
+        return last_gps_x, last_gps_y, True  # dropped out
+
+    meas_x = true_x + random.gauss(0.0, sigma)
+    meas_y = true_y + random.gauss(0.0, sigma)
+    return meas_x, meas_y, False
+
 
 # Store path for drawing
 path_x = [x]
@@ -54,6 +73,10 @@ for (ox, oy, r) in obstacles:
 boat_dot, = ax.plot([x], [y], marker="o")
 path_line, = ax.plot(path_x, path_y)
 
+
+# GPS dot - shows jittery measurement
+gps_dot, = ax.plot([gps_x], [gps_y], marker="x")
+
 #heading indicator line (shows which way boat points)
 heading_len = 1.0
 heading_arrow = ax.quiver(
@@ -78,6 +101,7 @@ hud = ax.text(
     family="monospace",
     bbox=dict(boxstyle="round", alpha=0.8)
 )
+
 def set_hud(t_s, step_idx, wp_reached, tx, ty, x, y, dist):
     hud.set_text(
         f"time(s):       {t_s:6.2f}\n"
@@ -138,16 +162,16 @@ def determine_speed(dist_to_wp, x, y, obstacles):
 
 
 
-def update_plot(x, y, heading, path_x, path_y):
-    #update boat and trail
-    boat_dot.set_data([x], [y])
+def update_plot(true_x, true_y, gps_x, gps_y, heading, path_x, path_y):
+    boat_dot.set_data([true_x], [true_y])
     path_line.set_data(path_x, path_y)
 
-    # update heading arrow (u, v is the arrow direction vector)
+    gps_dot.set_data([gps_x], [gps_y])
+
     u = heading_len * math.cos(heading)
     v = heading_len * math.sin(heading)
-    heading_arrow.set_offsets([x, y])  # move arrow base to boat position
-    heading_arrow.set_UVC(u, v)        # set arrow direction
+    heading_arrow.set_offsets([true_x, true_y])
+    heading_arrow.set_UVC(u, v)
 
     fig.canvas.draw()
     fig.canvas.flush_events()
@@ -217,10 +241,16 @@ with open("run_log.csv", "w", newline="") as f:
 
     i = 0  # waypoint index
     while i < len(waypoints):
+        #GPS read
+        gps_x, gps_y, gps_drop = read_gps(x, y, gps_x, gps_y, gps_sigma, gps_dropout_prob)
+
         tx, ty = waypoints[i]
-        dx = tx - x
-        dy = ty - y
-        dist = math.sqrt(dx*dx + dy*dy)
+
+        #compute guidance using GPS, not truth
+        dx = tx - gps_x
+        dy = ty - gps_y
+        dist = math.hypot(dx, dy)
+
         t_s = time.time() - start_time
 
         #log one row per loop (csv)
@@ -236,10 +266,13 @@ with open("run_log.csv", "w", newline="") as f:
             continue
 
         # goal directio0n
-        goal_dx = dx/dist
-        goal_dy = dy/dist
+        if dist > 1e-9:
+            goal_dx = dx / dist
+            goal_dy = dy / dist
+        else:
+            goal_dx, goal_dy = 0.0, 0.0
         # avoid direction (away from obstacles)
-        avoid_x, avoid_y = compute_avoid_vector(x, y, obstacles, safety_margin)
+        avoid_x, avoid_y = compute_avoid_vector(gps_x, gps_y, obstacles, safety_margin)
         # Blend them:
         avoid_weight = 9.0   # tune: bigger = stronger avoidance
         blend_dx = goal_dx + (avoid_weight * avoid_x)
@@ -252,9 +285,8 @@ with open("run_log.csv", "w", newline="") as f:
 
 
 
-
         #determine speed of boat 
-        step_used = determine_speed(dist, x, y, obstacles)
+        step_used = determine_speed(dist, gps_x, gps_y, obstacles)
         # Move boat towards target
         x += math.cos(heading) * step_used
         y += math.sin(heading) * step_used
@@ -262,7 +294,7 @@ with open("run_log.csv", "w", newline="") as f:
         path_y.append(y)
 
         # Update plot
-        update_plot(x, y, heading, path_x, path_y)
+        update_plot(x, y, gps_x, gps_y, heading, path_x, path_y)
         time.sleep(dt)
 
     #update hud 1 last time to show 4/4
